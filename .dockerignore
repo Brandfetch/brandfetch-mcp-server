@@ -1,0 +1,26 @@
+# Version control
+.git/
+.github/
+
+# Python caches / envs
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Docs / meta (not needed in the image)
+README.md
+CONTRIBUTING.md
+LICENSE
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
+
+# Local env files
+.env
+.env.*

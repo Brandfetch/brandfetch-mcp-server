@@ -1,0 +1,14 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.brandfetch/brandfetch",
+  "title": "Brandfetch",
+  "description": "Search brands and retrieve design assets, company data, other brand context from Brandfetch's API",
+  "version": "1.0.1",
+  "websiteUrl": "https://docs.brandfetch.com/mcp/overview",
+  "remotes": [
+    {
+      "type": "streamable-http",
+      "url": "https://mcp.brandfetch.io/mcp"
+    }
+  ]
+}
