@@ -28,8 +28,9 @@ uv run ruff check .     # lint
 uv run ruff format .    # format
 ```
 
-Please make sure `uv run ruff check .` and `uv run pytest` pass before opening a
-pull request. New tools or behavior changes should come with tests.
+Please make sure `uv run ruff check .`, `uv run ruff format --check .` and
+`uv run pytest` pass before opening a pull request — CI gates on all three. New
+tools or behavior changes should come with tests.
 
 ## Reporting issues
 
