@@ -1,12 +1,16 @@
 import contextvars
 import base64
+import hashlib
 import json
 import os
 from typing import Literal
-from urllib.parse import parse_qsl, urlparse, urlunparse
+from urllib.parse import parse_qsl, urlparse
 
 from fastmcp import FastMCP
+from fastmcp.resources import ResourceContent, ResourceResult
+from fastmcp.tools.tool import ToolResult
 import httpx
+from mcp.types import ResourceLink, TextContent
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.cors import CORSMiddleware
 from starlette.requests import Request
@@ -26,9 +30,27 @@ OAUTH_SERVER_URL = os.environ.get(
 )
 
 
-mcp = FastMCP("brandfetch-mcp-server")
+mcp = FastMCP(
+    "brandfetch-mcp-server",
+    instructions=(
+        "Brand data and assets (logos, icons, colors, fonts) from Brandfetch.\n\n"
+        "When a task needs actual image bytes, prefer fetching the "
+        "credentialed asset 'src' URLs from get_brand directly (curl, "
+        "requests, fetch) whenever your execution environment can reach "
+        "cdn.brandfetch.io — that keeps image bytes out of the conversation. "
+        "Route bytes through this server (the bf://asset/{domain}/{type} "
+        "resource, or get_asset_base64 as last resort) only when the CDN is "
+        "unreachable from your environment. On claude.ai, direct access "
+        "requires adding *.brandfetch.io to the sandbox domain allowlist "
+        "(Settings > Capabilities); suggest that to users who embed brand "
+        "assets regularly. Each tool documents its own usage details."
+    ),
+)
 
 ASSET_URL_ALLOWED_HOSTS = {"cdn.brandfetch.io"}
+# Where the CDN 302s programmatic fetches of URLs lacking a valid ?c= clientId
+# (hotlinking policy: tokenless URLs may only be displayed in web pages).
+ASSET_HOTLINK_REDIRECT_HOST = "docs.brandfetch.com"
 ASSET_URL_ALLOWED_TYPES = {"icon", "logo", "symbol"}
 ASSET_MAX_DIMENSION = 2048
 ASSET_MAX_BYTES = 5 * 1024 * 1024
@@ -36,12 +58,28 @@ ASSET_FETCH_TIMEOUT_SECONDS = 5.0
 BRAND_API_TIMEOUT_SECONDS = 35.0
 ASSET_FETCH_USER_AGENT = "Brandfetch-MCP/1.0 (asset-base64-tool)"
 ASSET_FETCH_CHUNK_SIZE = 64 * 1024
+# MIME-style wrap width for base64 tool output. Clients that must reproduce
+# the payload by hand (claude.ai code-mode retypes it into sandbox scripts)
+# drop characters inside long identical-character runs; short newline-anchored
+# lines make such corruption detectable and repairable line-by-line.
+ASSET_BASE64_LINE_WIDTH = 76
 ASSET_ALLOWED_MEDIA_TYPES = {
     "image/svg+xml",
     "image/png",
     "image/jpeg",
     "image/webp",
     "image/gif",
+}
+# Maps Brandfetch logo `format` strings to media types, used only to hint the
+# mimeType on resource_link blocks (the actual blob mime is taken from the CDN
+# response Content-Type at read time).
+ASSET_FORMAT_MEDIA_TYPES = {
+    "png": "image/png",
+    "svg": "image/svg+xml",
+    "webp": "image/webp",
+    "jpeg": "image/jpeg",
+    "jpg": "image/jpeg",
+    "gif": "image/gif",
 }
 
 
@@ -243,24 +281,11 @@ def _validate_asset_url(url: str) -> str:
     if not path_segments:
         raise ValueError("url must include a path with at least a brand identifier")
 
-    # Normalize get_brand URL shape: trailing /{type}.{ext} → /type/{type}
-    # e.g. .../logo.png → .../type/logo. Other file segments (e.g. banner IDs
-    # like "idu7P6rdmK.jpeg") pass through unmodified.
-    last_segment = path_segments[-1]
-    if "." in last_segment:
-        stem, _, _ = last_segment.rpartition(".")
-        if stem in ASSET_URL_ALLOWED_TYPES:
-            path_segments = path_segments[:-1] + ["type", stem]
-            normalized_url = urlunparse(
-                (
-                    parsed.scheme,
-                    parsed.netloc,
-                    "/" + "/".join(path_segments),
-                    parsed.params,
-                    parsed.query,
-                    "",
-                )
-            )
+    # The URL is fetched exactly as given. In particular, extension URLs from
+    # get_brand (.../logo.svg, .../icon.jpeg) must NOT be rewritten to the
+    # extensionless /type/{type} endpoint: that endpoint lets the CDN pick the
+    # format (typically WebP), which silently discards an explicitly requested
+    # format — e.g. a vector SVG would come back as a rasterized WebP.
 
     # Validate w/h dimensions wherever they appear in the path
     i = 0
@@ -295,6 +320,199 @@ def _validate_asset_url(url: str) -> str:
     return normalized_url
 
 
+def _wrap_base64(encoded: str) -> str:
+    """Wrap a base64 string at ASSET_BASE64_LINE_WIDTH chars per line."""
+    return "\n".join(
+        encoded[i : i + ASSET_BASE64_LINE_WIDTH]
+        for i in range(0, len(encoded), ASSET_BASE64_LINE_WIDTH)
+    )
+
+
+def _redirect_host_error(final_host: str) -> str:
+    """Tool error for a fetch that redirected off the allowed CDN hosts.
+
+    A redirect to docs.brandfetch.com is the CDN's hotlinking policy kicking in:
+    the URL carries no valid ?c= clientId, so it is display-only and cannot be
+    fetched programmatically. Surface that specifically — the generic
+    disallowed-host message reads like a missing asset and sends callers down
+    the wrong debugging path.
+    """
+    if final_host == ASSET_HOTLINK_REDIRECT_HOST:
+        return _tool_error(
+            "hotlink_blocked",
+            "the CDN redirected to its hotlinking policy page: this URL has no "
+            "valid '?c=' clientId, so it can only be displayed in a web page, "
+            "not fetched programmatically. Use the asset 'src' URLs returned by "
+            "get_brand, which carry per-request credentials.",
+        )
+    return _tool_error(
+        "fetch_failed",
+        f"redirect target host '{final_host}' is not an allowed Brandfetch CDN host",
+    )
+
+
+async def _stream_cdn_asset(source_url: str) -> tuple[bytes, str, int, int | None]:
+    """Fetch a (pre-validated) cdn.brandfetch.io asset.
+
+    Returns (data, media_type, size_bytes, status_code). Raises
+    ValueError(_tool_error(...)) on any failure. Shared by the get_asset_base64
+    tool and the bf://asset resource so the allowed-host, size, and media-type
+    guards stay identical across both paths.
+    """
+    chunks: list[bytes] = []
+    total_size = 0
+    media_type: str | None = None
+    status_code: int | None = None
+
+    try:
+        async with httpx.AsyncClient(timeout=ASSET_FETCH_TIMEOUT_SECONDS) as client:
+            async with client.stream(
+                "GET",
+                source_url,
+                headers={
+                    "User-Agent": ASSET_FETCH_USER_AGENT,
+                    "Accept": "image/*",
+                },
+                follow_redirects=True,
+            ) as response:
+                status_code = response.status_code
+
+                final_host = (urlparse(str(response.url)).hostname or "").lower()
+                if final_host not in ASSET_URL_ALLOWED_HOSTS:
+                    raise ValueError(_redirect_host_error(final_host))
+
+                if not response.is_success:
+                    raise ValueError(
+                        _tool_error(
+                            "fetch_failed",
+                            f"upstream returned HTTP {response.status_code} for '{source_url}'",
+                        )
+                    )
+
+                content_length = response.headers.get("Content-Length")
+                if content_length:
+                    try:
+                        content_length_bytes = int(content_length)
+                    except ValueError:
+                        content_length_bytes = None
+                    if (
+                        content_length_bytes is not None
+                        and content_length_bytes > ASSET_MAX_BYTES
+                    ):
+                        raise ValueError(
+                            _tool_error(
+                                "asset_too_large",
+                                f"asset exceeds {ASSET_MAX_BYTES} bytes; request a smaller variant via build_logo_urls",
+                            )
+                        )
+
+                media_type = _normalize_media_type(response.headers.get("Content-Type"))
+                if not media_type:
+                    raise ValueError(
+                        _tool_error(
+                            "fetch_failed",
+                            "upstream returned unsupported or missing image Content-Type",
+                        )
+                    )
+
+                async for chunk in response.aiter_bytes(
+                    chunk_size=ASSET_FETCH_CHUNK_SIZE
+                ):
+                    total_size += len(chunk)
+                    if total_size > ASSET_MAX_BYTES:
+                        raise ValueError(
+                            _tool_error(
+                                "asset_too_large",
+                                f"asset exceeds {ASSET_MAX_BYTES} bytes; request a smaller variant via build_logo_urls",
+                            )
+                        )
+                    chunks.append(chunk)
+    except ValueError:
+        raise
+    except httpx.TimeoutException as exc:
+        raise ValueError(
+            _tool_error(
+                "fetch_failed",
+                f"upstream fetch timed out after {int(ASSET_FETCH_TIMEOUT_SECONDS * 1000)}ms",
+            )
+        ) from exc
+    except httpx.HTTPError as exc:
+        raise ValueError(
+            _tool_error("fetch_failed", f"upstream fetch failed: {exc}")
+        ) from exc
+
+    return b"".join(chunks), media_type, total_size, status_code
+
+
+async def _get_brand_json(identifier: str) -> dict:
+    """Fetch brand data as parsed JSON (used by the bf://asset resource resolver)."""
+    api_key = _get_api_key()
+    async with httpx.AsyncClient(timeout=BRAND_API_TIMEOUT_SECONDS) as client:
+        resp = await client.get(
+            f"{BRANDFETCH_API_BASE}/brands/{identifier}",
+            headers={"Authorization": f"Bearer {api_key}"},
+        )
+    if not resp.is_success:
+        raise ValueError(
+            _error_message(
+                resp.status_code,
+                resp.text,
+                f'Brand not found for identifier "{identifier}".',
+            )
+        )
+    return resp.json()
+
+
+def _resolve_asset_src(brand: dict, asset_type: str) -> str | None:
+    """Return a CDN src URL (with per-request ?c= token) for the given asset type.
+
+    The token-bearing src from the brand response is what the CDN allows to be
+    fetched programmatically — a plain clientId URL would be hotlink-blocked.
+    """
+    for logo in (brand or {}).get("logos") or []:
+        if logo.get("type") != asset_type:
+            continue
+        for fmt in logo.get("formats") or []:
+            src = fmt.get("src")
+            if src:
+                return src
+    return None
+
+
+def _asset_resource_links(brand: dict) -> list[ResourceLink]:
+    """Build resource_link blocks (one per available asset type) for a brand.
+
+    These are cheap URIs the client can read on demand via bf://asset/{domain}/{type};
+    the bytes are only materialized when the client actually reads the resource.
+    """
+    domain = (brand or {}).get("domain")
+    if not domain:
+        return []
+
+    links: list[ResourceLink] = []
+    seen: set[str] = set()
+    for logo in brand.get("logos") or []:
+        asset_type = logo.get("type")
+        if asset_type not in ASSET_URL_ALLOWED_TYPES or asset_type in seen:
+            continue
+        seen.add(asset_type)
+        first_format = (logo.get("formats") or [{}])[0].get("format")
+        links.append(
+            ResourceLink(
+                type="resource_link",
+                uri=f"bf://asset/{domain}/{asset_type}",
+                name=f"{domain} {asset_type}",
+                description=(
+                    f"{asset_type} image for {domain}, served as bytes through the MCP "
+                    "server. Read this resource when the CDN URL cannot be fetched "
+                    "directly (sandboxed or network-restricted environments)."
+                ),
+                mimeType=ASSET_FORMAT_MEDIA_TYPES.get(first_format),
+            )
+        )
+    return links
+
+
 @mcp.tool(
     annotations={
         "title": "Search Brands",
@@ -321,11 +539,10 @@ async def brand_search(query: str) -> str:
       to fetch full details.
     - `name` (str): Display name.
     - `icon` (str): CDN URL to a small representation of the brand, suitable
-      for autocomplete-style UIs. The CDN supports asset-type substitution:
-      replacing the `/icon/` segment in the URL path with `/logo/` returns the
-      brand's logo at the same size; `/symbol/` returns the symbol. Dimensions
-      can also be modified via the `/w/{width}/h/{height}/` segments. See the
-      Logo API tool for the full URL-construction grammar.
+      for autocomplete-style UIs. Display-only: embed it as returned (e.g. in
+      an `<img>` tag) — it is not programmatically fetchable, and must not be
+      edited. For other asset types, sizes, or downloadable bytes, call
+      `get_brand`; for display-only variants, `build_logo_urls`.
     - `claimed` (bool): Whether the brand has officially claimed their listing.
       Claimed brands generally have higher-quality, brand-approved assets.
     - `verified` (bool): Whether Brandfetch has verified the listing.
@@ -371,7 +588,7 @@ async def brand_search(query: str) -> str:
         "openWorldHint": True,
     },
 )
-async def get_brand(identifier: str) -> str:
+async def get_brand(identifier: str) -> ToolResult:
     """Look up full brand data by domain, stock ticker, ISIN, or crypto symbol.
 
     Call this directly when you have a confident identifier — either from a
@@ -418,14 +635,18 @@ async def get_brand(identifier: str) -> str:
     with any other client ID (including one from context or memory) will break
     the URL.
 
-    If your environment cannot fetch these URLs directly (sandboxed code
-    execution, restricted networks), use `get_asset_base64` to retrieve the
-    asset bytes through the MCP instead.
+    To download asset bytes, fetch the `src` URL directly (curl/requests)
+    whenever your environment can reach cdn.brandfetch.io — that keeps the
+    bytes out of the conversation. Otherwise fall back to the
+    `resource_link` blocks this tool returns (`bf://asset/{domain}/{type}`),
+    or to `get_asset_base64` — see that tool for the claude.ai
+    network-allowlist details.
 
     Errors:
     - 403 / "explicit deny": The brand exists in the index but is not
       accessible on the current API tier or has access restrictions. Do not
-      retry — fall back to the `icon` from `brand_search` or inform the user.
+      retry — fall back to displaying the `icon` URL from `brand_search`
+      (display-only, not downloadable) or inform the user.
     - 404: Identifier not found. Try `brand_search` with a name query instead.
 
     Args:
@@ -454,7 +675,15 @@ async def get_brand(identifier: str) -> str:
                 f'Brand not found for identifier "{identifier}".',
             )
         )
-    return resp.text
+
+    # Attach resource_link blocks (one per available asset type) so the client
+    # can read the image bytes on demand via bf://asset/{domain}/{type} instead
+    # of fetching the CDN directly. Links are cheap; bytes load only on read.
+    try:
+        links = _asset_resource_links(resp.json())
+    except (json.JSONDecodeError, ValueError):
+        links = []
+    return ToolResult(content=[TextContent(type="text", text=resp.text), *links])
 
 
 @mcp.tool(
@@ -476,7 +705,9 @@ async def enrich_transaction(transaction_label: str, country_code: str) -> str:
 
     Returns brand data matching the shape from `get_brand` (domain, name,
     logos, colors, etc.) for the identified merchant, or an error if no
-    confident match is found.
+    confident match is found. URLs in the response carry per-request
+    credentials — use them exactly as returned, never edited (same rule as
+    `get_brand`).
 
     Examples:
     - transaction_label: "STARBUCKS GENEVA", country_code: "CH"
@@ -643,7 +874,7 @@ async def build_logo_urls(
     width: int | None = None,
     height: int | None = None,
     fallback: Literal["brandfetch", "transparent", "lettermark", "404"] | None = "404",
-) -> list[str]:
+) -> list[str] | dict[str, list[str] | str]:
     """Construct Brandfetch Logo CDN URLs for one or more brands. No API call
     is made — returns ready-to-embed URL strings.
 
@@ -652,7 +883,10 @@ async def build_logo_urls(
     They are intended for direct browser rendering only (e.g. `<img src="...">`
     in an HTML page). Programmatic fetching or downloading of these assets —
     such as HTTP GET requests from a server or script using only the clientId
-    embedded in the URL — will be blocked and return an error.
+    embedded in the URL — will be blocked and return an error. If the session
+    has no clientId at all, the URLs are built without a `?c=` token and the
+    result is `{"urls": [...], "warning": "..."}` instead of a plain list —
+    those URLs cannot be fetched programmatically under any circumstances.
 
     If you need to actually download or process an asset (save to disk, read
     pixel data, attach to an email, etc.), use `get_brand` instead. The CDN
@@ -747,6 +981,18 @@ async def build_logo_urls(
         },
     )
 
+    if not client_id:
+        return {
+            "urls": urls,
+            "warning": (
+                "No clientId is available on this session, so these URLs carry "
+                "no '?c=' token. They can only be displayed inside a web page "
+                "(e.g. an <img> tag); any programmatic fetch — curl, sandboxed "
+                "code, or get_asset_base64 — will be redirected to the "
+                "hotlinking policy page and blocked. To download asset bytes, "
+                "use the 'src' URLs returned by get_brand instead."
+            ),
+        }
     return urls
 
 
@@ -761,7 +1007,7 @@ async def build_logo_urls(
 )
 async def get_asset_base64(url: str) -> dict[str, str | int]:
     """Fetch a Brandfetch CDN asset (logo, icon, symbol, image) and return it
-    as a base64 data URI for direct embedding.
+    as line-wrapped, checksummed base64 for embedding in generated files.
 
     Use this when you need to embed a brand logo or image into a file generated
     in a sandboxed or network-restricted environment where cdn.brandfetch.io is
@@ -770,37 +1016,90 @@ async def get_asset_base64(url: str) -> dict[str, str | int]:
     download or embed of a logo, icon, or picture is needed and the CDN URL
     cannot be fetched by the caller.
 
-    Do not use this when a normal browser can fetch the image URL directly.
-    Base64 increases payload size and bypasses CDN caching.
+    Do not use this when your environment can fetch the image URL itself —
+    a browser rendering the page, or sandboxed code whose network allowlist
+    covers `cdn.brandfetch.io`. In those cases fetch the `get_brand` `src`
+    URL directly (curl/requests): it is faster and keeps base64 out of the
+    conversation. If a sandbox fetch is blocked by network policy, tell the
+    user they can allow it on claude.ai under Settings > Capabilities by
+    enabling network egress and adding `*.brandfetch.io` to the domain
+    allowlist — then this tool is not needed at all. Base64 increases
+    payload size and bypasses CDN caching.
+
+    If your client supports MCP resource reads, prefer the
+    `bf://asset/{domain}/{type}` resource links returned by `get_brand` over
+    this tool — the bytes are delivered out-of-band and skip the
+    conversation entirely.
 
     Accepts any `cdn.brandfetch.io` asset URL — logos, icons, symbols, banners,
-    hero images, and other brand-record assets. Examples:
-    - `build_logo_urls` output:  .../w/400/h/400/theme/dark/type/icon?c=<token>
+    hero images, and other brand-record assets. Prefer the `src` URLs from
+    `get_brand`, whose `?c=` token carries per-request credentials:
     - `get_brand` src fields:    .../w/800/h/111/theme/light/logo.png?c=<token>
     - Brand-record images:       .../idwlR7BDjL/idu7P6rdmK.jpeg?c=<token>
-    Only the `?c=` query parameter is allowed. Width and height, if present,
-    must each be ≤ 2048.
+    `build_logo_urls` output is generally NOT fetchable through this tool: those
+    URLs are display-only under the hotlinking policy and fail with
+    `hotlink_blocked`. Only the `?c=` query parameter is allowed. Width and
+    height, if present, must each be ≤ 2048.
 
-    Format: The CDN typically returns WebP for raster assets and SVG for vector
-    assets. Callers targeting PowerPoint, DOCX, or older clients should be
-    prepared to convert WebP → PNG if needed (e.g. via Pillow).
+    Format: the URL is fetched exactly as given. Extension URLs from `get_brand`
+    (.../logo.svg, .../logo.png, .../icon.jpeg) return that format; extensionless
+    `type/{type}` URLs from `build_logo_urls` let the CDN pick the format
+    (typically WebP). Callers targeting PowerPoint, DOCX, or older clients should
+    prefer an explicit .png URL, or be prepared to convert WebP → PNG (e.g. via
+    Pillow). Always trust `media_type` in the response over the URL extension.
+
+    The base64 payload is wrapped at 76 characters per line (MIME style).
+    This is deliberate: if you must reproduce the payload yourself (e.g.
+    writing it into a sandbox file via a heredoc), short anchored lines are
+    far less error-prone than one unbroken blob — long runs of identical
+    characters (AAAA…, JPEG null padding) are where characters get dropped
+    in transcription. Standard decoders (`base64 -d`, Python `b64decode`)
+    ignore the newlines; strip them yourself only when building a data URI.
+
+    ALWAYS verify after writing the decoded file:
+
+        b64 = result["base64"]
+        assert len(b64.replace("\\n", "")) == result["base64_length"]
+        data = base64.b64decode(b64)
+        assert hashlib.sha256(data).hexdigest() == result["sha256"]
+        Path("/tmp/logo.png").write_bytes(data)
+
+    If verification fails, you corrupted the payload while reproducing it —
+    the wrapping makes this repairable: every line except the last must be
+    exactly 76 characters, so find the short/long line and re-copy just that
+    line from the tool result. Do NOT retype the whole payload again, and do
+    not try to patch the bytes. If it keeps failing, prefer a variant with
+    fewer characters (the .svg format when available, or a smaller w/h
+    raster), or tell the user that allowlisting `*.brandfetch.io` on
+    claude.ai (Settings > Capabilities) enables direct download and avoids
+    transcription entirely.
 
     Context window cost: each base64 asset adds roughly 50–80 KB to the
     conversation. For multi-asset workflows (logo + symbol, light + dark
-    variants), decode and write each asset to disk immediately after fetching
-    rather than accumulating data URIs in context:
+    variants), decode and write each asset to disk immediately after
+    fetching rather than accumulating payloads in context.
 
-        data = base64.b64decode(result["data_uri"].split(",", 1)[1])
-        Path("/tmp/logo.png").write_bytes(data)
+    Theme segments (`/theme/light`, `/theme/dark`) in URLs follow
+    `build_logo_urls`' convention: they name the asset's own color, not the
+    background it sits on.
 
-    Theme convention (same as `build_logo_urls`):
-    - theme=light → light-colored asset (white/pale), for display on dark backgrounds
-    - theme=dark  → dark-colored asset, for display on light backgrounds
-    The parameter names the asset's own color, not the background.
+    Errors (JSON with a `code` field):
+    - `hotlink_blocked`: the URL has no valid `?c=` token (typical for
+      `build_logo_urls` output). Use a `src` URL from `get_brand` instead.
+    - `asset_too_large`: decoded asset exceeds 5 MB. Request a smaller
+      `w`/`h` variant.
+    - `invalid_input`: malformed URL, disallowed host or query params, or
+      width/height above 2048.
+    - `fetch_failed`: upstream CDN failure (timeout, non-2xx, unsupported
+      content type). Safe to retry once; if it persists, try another format
+      variant from `get_brand`.
 
     Returns:
-        data_uri: Full `data:image/...;base64,...` payload ready for embedding.
-        media_type: Normalized media type (e.g. "image/webp", "image/svg+xml").
+        base64: Base64 payload, wrapped at 76 chars/line. For an inline data
+            URI, strip newlines: `data:{media_type};base64,{joined}`.
+        base64_length: Character count of the unwrapped base64 payload.
+        sha256: Hex SHA-256 of the decoded bytes — verify written files.
+        media_type: Normalized media type (e.g. "image/png", "image/svg+xml").
         size_bytes: Size of decoded asset bytes.
         source_url: URL fetched by this tool.
     """
@@ -809,94 +1108,9 @@ async def get_asset_base64(url: str) -> dict[str, str | int]:
     except ValueError as exc:
         raise ValueError(_tool_error("invalid_input", str(exc))) from exc
 
-    chunks: list[bytes] = []
-    total_size = 0
-    media_type: str | None = None
-    status_code: int | None = None
+    data, media_type, total_size, status_code = await _stream_cdn_asset(source_url)
 
-    try:
-        async with httpx.AsyncClient(timeout=ASSET_FETCH_TIMEOUT_SECONDS) as client:
-            async with client.stream(
-                "GET",
-                source_url,
-                headers={
-                    "User-Agent": ASSET_FETCH_USER_AGENT,
-                    "Accept": "image/*",
-                },
-                follow_redirects=True,
-            ) as response:
-                status_code = response.status_code
-
-                final_host = (urlparse(str(response.url)).hostname or "").lower()
-                if final_host not in ASSET_URL_ALLOWED_HOSTS:
-                    raise ValueError(
-                        _tool_error(
-                            "fetch_failed",
-                            f"redirect target host '{final_host}' is not an allowed Brandfetch CDN host",
-                        )
-                    )
-
-                if not response.is_success:
-                    raise ValueError(
-                        _tool_error(
-                            "fetch_failed",
-                            f"upstream returned HTTP {response.status_code} for '{source_url}'",
-                        )
-                    )
-
-                content_length = response.headers.get("Content-Length")
-                if content_length:
-                    try:
-                        content_length_bytes = int(content_length)
-                    except ValueError:
-                        content_length_bytes = None
-                    if (
-                        content_length_bytes is not None
-                        and content_length_bytes > ASSET_MAX_BYTES
-                    ):
-                        raise ValueError(
-                            _tool_error(
-                                "asset_too_large",
-                                f"asset exceeds {ASSET_MAX_BYTES} bytes; request a smaller variant via build_logo_urls",
-                            )
-                        )
-
-                media_type = _normalize_media_type(response.headers.get("Content-Type"))
-                if not media_type:
-                    raise ValueError(
-                        _tool_error(
-                            "fetch_failed",
-                            "upstream returned unsupported or missing image Content-Type",
-                        )
-                    )
-
-                async for chunk in response.aiter_bytes(
-                    chunk_size=ASSET_FETCH_CHUNK_SIZE
-                ):
-                    total_size += len(chunk)
-                    if total_size > ASSET_MAX_BYTES:
-                        raise ValueError(
-                            _tool_error(
-                                "asset_too_large",
-                                f"asset exceeds {ASSET_MAX_BYTES} bytes; request a smaller variant via build_logo_urls",
-                            )
-                        )
-                    chunks.append(chunk)
-    except ValueError:
-        raise
-    except httpx.TimeoutException as exc:
-        raise ValueError(
-            _tool_error(
-                "fetch_failed",
-                f"upstream fetch timed out after {int(ASSET_FETCH_TIMEOUT_SECONDS * 1000)}ms",
-            )
-        ) from exc
-    except httpx.HTTPError as exc:
-        raise ValueError(
-            _tool_error("fetch_failed", f"upstream fetch failed: {exc}")
-        ) from exc
-
-    encoded_asset = base64.b64encode(b"".join(chunks)).decode("ascii")
+    encoded_asset = base64.b64encode(data).decode("ascii")
     _publish_event(
         "mcp.asset-base64.fetched",
         {
@@ -908,11 +1122,64 @@ async def get_asset_base64(url: str) -> dict[str, str | int]:
         },
     )
     return {
-        "data_uri": f"data:{media_type};base64,{encoded_asset}",
+        "base64": _wrap_base64(encoded_asset),
+        "base64_length": len(encoded_asset),
+        "sha256": hashlib.sha256(data).hexdigest(),
         "media_type": media_type,
         "size_bytes": total_size,
         "source_url": source_url,
     }
+
+
+@mcp.resource(
+    "bf://asset/{domain}/{type}",
+    name="Brand asset",
+    description=(
+        "Brand icon, logo, or symbol image for a domain, served as raw image "
+        "bytes through the MCP server (resolved server-side from the Brandfetch "
+        "CDN). Read this instead of fetching the CDN directly when the asset is "
+        "needed in a sandboxed or network-restricted environment. URI shape: "
+        "bf://asset/{domain}/{type} where type is icon, logo, or symbol."
+    ),
+)
+async def asset_resource(domain: str, type: str) -> ResourceResult:
+    """Serve a brand asset (icon/logo/symbol) as image bytes via a resource read.
+
+    Resolution: looks up the brand for `domain`, picks the asset matching `type`,
+    and fetches its CDN src (which carries the per-request ?c= token that the CDN
+    allows for programmatic access) server-side. The blob's mime type reflects the
+    actual CDN response.
+    """
+    if type not in ASSET_URL_ALLOWED_TYPES:
+        raise ValueError(
+            _tool_error(
+                "invalid_input",
+                f"unsupported asset type '{type}'; expected one of {sorted(ASSET_URL_ALLOWED_TYPES)}",
+            )
+        )
+
+    brand = await _get_brand_json(domain)
+    src = _resolve_asset_src(brand, type)
+    if not src:
+        raise ValueError(
+            _tool_error("not_found", f"no {type} asset available for '{domain}'")
+        )
+
+    source_url = _validate_asset_url(src)
+    data, media_type, total_size, status_code = await _stream_cdn_asset(source_url)
+
+    _publish_event(
+        "mcp.asset-resource.read",
+        {
+            "domain": domain,
+            "type": type,
+            "success": True,
+            "statusCode": status_code,
+            "sizeBytes": total_size,
+            "mediaType": media_type,
+        },
+    )
+    return ResourceResult(contents=[ResourceContent(data, mime_type=media_type)])
 
 
 async def health(request: Request):

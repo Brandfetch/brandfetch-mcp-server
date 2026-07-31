@@ -1,7 +1,7 @@
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "brandfetch",
-  "version": "1.0.2",
+  "version": "1.1.0",
   "description": "Search brands and retrieve design assets, company data, and other brand context from Brandfetch's API.",
   "author": { "name": "Brandfetch", "url": "https://brandfetch.com" },
   "homepage": "https://docs.brandfetch.com/mcp/overview",
