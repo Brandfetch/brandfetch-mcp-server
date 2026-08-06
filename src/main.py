@@ -82,6 +82,11 @@ ASSET_FORMAT_MEDIA_TYPES = {
     "gif": "image/gif",
 }
 
+FEEDBACK_SLACK_TIMEOUT_SECONDS = 5.0
+# Slack rejects section blocks whose text exceeds 3000 characters; keep
+# headroom for the truncation marker appended after escaping.
+FEEDBACK_MAX_CHARS = 2900
+
 
 # Per-request context for credentials, set by CredentialsMiddleware.
 _api_key_var: contextvars.ContextVar[str] = contextvars.ContextVar("api_key")
@@ -1180,6 +1185,155 @@ async def asset_resource(domain: str, type: str) -> ResourceResult:
         },
     )
     return ResourceResult(contents=[ResourceContent(data, mime_type=media_type)])
+
+
+def _slack_escape(text: str) -> str:
+    """Escape the three characters Slack treats as control sequences in mrkdwn."""
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+@mcp.tool(
+    annotations={
+        "title": "Send Feedback",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    },
+)
+async def send_feedback(
+    message: str,
+    category: Literal[
+        "bug", "data-quality", "feature-request", "documentation", "praise", "other"
+    ] = "other",
+    tool_name: str | None = None,
+) -> str:
+    """Send feedback about the Brandfetch MCP server to the Brandfetch team.
+
+    Use this to report anything that would help improve this MCP server:
+    - A tool call failed, timed out, or returned something inconsistent with
+      its documented behavior.
+    - A tool description was confusing or misled you into a wrong call.
+    - Brand data was wrong, stale, or missing (wrong logo, outdated colors,
+      missing company info) — include the brand's domain in the message.
+    - A capability you needed was missing (e.g. a filter, a data field, a
+      whole tool).
+    - The user explicitly asked to send feedback, or expressed praise or
+      frustration about Brandfetch that they want passed along.
+
+    Write feedback the way you would want to receive a bug report: what you
+    were trying to do, the exact tool call and arguments, what you expected,
+    and what actually happened. Specific and structured beats polite and
+    vague. Send one call per distinct issue rather than bundling several
+    topics into one message.
+
+    This is a one-way channel to the Brandfetch team — nobody replies through
+    it. For account or billing help, direct the user to
+    https://developers.brandfetch.com instead. Never include API keys, bearer
+    tokens, or personal data in the message.
+
+    Returns a JSON acknowledgment: {"status": "received", ...}.
+
+    Args:
+        message: The feedback text. Plain text or simple markdown; messages
+            longer than ~2900 characters are truncated.
+        category: One of "bug", "data-quality", "feature-request",
+            "documentation", "praise", "other". Default "other".
+        tool_name: Name of the tool the feedback concerns (e.g. "get_brand"),
+            if it concerns a specific tool.
+    """
+    text = _slack_escape(message.strip()) if message else ""
+    if not text:
+        raise ValueError(_tool_error("invalid_input", "message must not be empty"))
+
+    truncated = len(text) > FEEDBACK_MAX_CHARS
+    if truncated:
+        text = text[:FEEDBACK_MAX_CHARS] + "… [truncated]"
+
+    tool = (tool_name or "").strip()
+    client_id = _client_id_var.get("")
+    org_urn = _org_urn_var.get("")
+    stage = os.environ.get("STAGE", "local")
+
+    context_parts = [f"category: *{category}*"]
+    if tool:
+        context_parts.append(f"tool: {_slack_escape(tool)}")
+    if org_urn:
+        context_parts.append(f"actor: {org_urn}")
+    elif client_id:
+        context_parts.append(f"actor: client-id {client_id}")
+    else:
+        context_parts.append("actor: anonymous")
+
+    delivered = False
+    webhook_url = os.environ.get("SLACK_FEEDBACK_WEBHOOK_URL", "")
+    if webhook_url:
+        # One webhook serves every environment, so the stage leads the
+        # message, matching the `[production]` convention of the other
+        # Slack notifications.
+        payload = {
+            "text": f"[{stage}] New MCP server feedback ({category})",
+            "blocks": [
+                {
+                    "type": "context",
+                    "elements": [{"type": "mrkdwn", "text": f"[{stage}]"}],
+                },
+                {
+                    "type": "header",
+                    "text": {"type": "plain_text", "text": "New MCP server feedback"},
+                },
+                {"type": "section", "text": {"type": "mrkdwn", "text": text}},
+                {
+                    "type": "context",
+                    "elements": [{"type": "mrkdwn", "text": " | ".join(context_parts)}],
+                },
+            ],
+        }
+        try:
+            async with httpx.AsyncClient(
+                timeout=FEEDBACK_SLACK_TIMEOUT_SECONDS
+            ) as client:
+                resp = await client.post(webhook_url, json=payload)
+            delivered = resp.is_success
+            if not delivered:
+                print(
+                    f"[mcp-server] Slack feedback webhook returned "
+                    f"{resp.status_code}: {resp.text}"
+                )
+        except httpx.HTTPError as exc:
+            print(f"[mcp-server] Slack feedback webhook failed: {exc}")
+    else:
+        print(
+            "[mcp-server] SLACK_FEEDBACK_WEBHOOK_URL is not configured; "
+            "feedback recorded as event only"
+        )
+
+    _publish_event(
+        "mcp.feedback.submitted",
+        {
+            "category": category,
+            **({"toolName": tool} if tool else {}),
+            "message": text,
+            "delivered": delivered,
+            "truncated": truncated,
+        },
+    )
+
+    if webhook_url and not delivered:
+        raise ValueError(
+            _tool_error(
+                "delivery_failed",
+                "Feedback could not be delivered. Do not retry; "
+                "let the user know it failed.",
+            )
+        )
+
+    return json.dumps(
+        {
+            "status": "received",
+            "message": "Thanks — your feedback has been shared with the Brandfetch team.",
+        }
+    )
 
 
 async def health(request: Request):
