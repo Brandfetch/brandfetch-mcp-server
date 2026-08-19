@@ -40,10 +40,23 @@ mcp = FastMCP(
         "cdn.brandfetch.io — that keeps image bytes out of the conversation. "
         "Route bytes through this server (the bf://asset/{domain}/{type} "
         "resource, or get_asset_base64 as last resort) only when the CDN is "
-        "unreachable from your environment. On claude.ai, direct access "
-        "requires adding *.brandfetch.io to the sandbox domain allowlist "
-        "(Settings > Capabilities); suggest that to users who embed brand "
-        "assets regularly. Each tool documents its own usage details."
+        "unreachable from your environment.\n\n"
+        "IMPORTANT — claude.ai users: the code-execution sandbox cannot "
+        "reach cdn.brandfetch.io until *.brandfetch.io is added to the "
+        "domain allowlist (Settings > Capabilities, enable network egress). "
+        "Without it, every asset fetch fails or falls back to base64 "
+        "through the conversation — slower, error-prone (corrupted files), "
+        "and it inflates token usage and cost. Whenever a CDN fetch is "
+        "blocked or you are about to fall back to get_asset_base64, tell "
+        "the user to add the allowlist entry first. Each tool documents "
+        "its own usage details.\n\n"
+        "Feedback loop: this server has a send_feedback tool — use it "
+        "proactively, not only when asked. Call it whenever a tool call "
+        "fails unexpectedly or returns something inconsistent with its "
+        "docs, brand data looks wrong, stale, or missing, a capability you "
+        "needed doesn't exist, or the user expresses frustration or praise "
+        "about Brandfetch. A short specific report (tool, arguments, "
+        "expected vs. actual) is enough."
     ),
 )
 
@@ -230,6 +243,20 @@ def _publish_event(event_name: str, payload: dict) -> None:
     )
 
 
+FEEDBACK_NUDGE = (
+    "If this looks like a Brandfetch problem or a data gap (not a usage "
+    "mistake), report it with the send_feedback tool."
+)
+# Statuses that are the caller's to fix (credentials, access tier, quota):
+# their messages already carry the remedy, so no feedback nudge.
+_NUDGE_EXCLUDED_STATUSES = {401, 403, 429}
+# _tool_error codes worth feedback: upstream/CDN failures and data gaps.
+# Everything else (invalid_input, hotlink_blocked, asset_too_large,
+# delivery_failed) is either a usage mistake with its own remedy text or
+# send_feedback's own failure — nudging there would loop feedback on itself.
+_NUDGE_ELIGIBLE_CODES = {"fetch_failed", "not_found"}
+
+
 def _error_message(status: int, body: str, context: str) -> str:
     messages = {
         401: "Unauthorized: invalid or missing API key.",
@@ -237,11 +264,17 @@ def _error_message(status: int, body: str, context: str) -> str:
         404: context,
         429: "API key quota exceeded. Please check your plan limits.",
     }
-    return messages.get(status, f"Brandfetch API error ({status}): {body}")
+    message = messages.get(status, f"Brandfetch API error ({status}): {body}")
+    if status not in _NUDGE_EXCLUDED_STATUSES:
+        message = f"{message} {FEEDBACK_NUDGE}"
+    return message
 
 
 def _tool_error(code: str, message: str) -> str:
-    return json.dumps({"code": code, "message": message})
+    payload: dict[str, str] = {"code": code, "message": message}
+    if code in _NUDGE_ELIGIBLE_CODES:
+        payload["hint"] = FEEDBACK_NUDGE
+    return json.dumps(payload)
 
 
 def _normalize_media_type(content_type: str | None) -> str | None:
@@ -654,6 +687,10 @@ async def get_brand(identifier: str) -> ToolResult:
       (display-only, not downloadable) or inform the user.
     - 404: Identifier not found. Try `brand_search` with a name query instead.
 
+    If the returned data is visibly wrong or stale (wrong logo, outdated
+    colors, missing company info), report it with send_feedback (category
+    "data-quality"), including the brand's domain.
+
     Args:
         identifier: A domain ("nike.com"), ticker ("NKE"), ISIN
             ("US6541061031"), or crypto symbol ("BTC").
@@ -822,6 +859,9 @@ async def get_brand_context(domain: str) -> str:
 
     Note that this is generated content — language may occasionally be
     flowery or non-English. Treat it as a strong starting point, not gospel.
+    If the context is clearly wrong for the brand (wrong company, hallucinated
+    products, non-English output), report it with send_feedback (category
+    "data-quality"), including the domain.
 
     Errors:
     - 503: Service temporarily unavailable. Retry once after a brief delay.
@@ -1025,11 +1065,15 @@ async def get_asset_base64(url: str) -> dict[str, str | int]:
     a browser rendering the page, or sandboxed code whose network allowlist
     covers `cdn.brandfetch.io`. In those cases fetch the `get_brand` `src`
     URL directly (curl/requests): it is faster and keeps base64 out of the
-    conversation. If a sandbox fetch is blocked by network policy, tell the
-    user they can allow it on claude.ai under Settings > Capabilities by
-    enabling network egress and adding `*.brandfetch.io` to the domain
-    allowlist — then this tool is not needed at all. Base64 increases
-    payload size and bypasses CDN caching.
+    conversation.
+
+    On claude.ai, before falling back to this tool, ALWAYS tell the user
+    the better fix: enable network egress and add `*.brandfetch.io` to the
+    sandbox domain allowlist under Settings > Capabilities — then the CDN
+    is fetchable directly and this tool is not needed at all. Skipping
+    that step has real costs: the base64 fallback is slower, risks
+    corrupted files during transcription, drives up token usage and cost,
+    and bypasses CDN caching.
 
     If your client supports MCP resource reads, prefer the
     `bf://asset/{domain}/{type}` resource links returned by `get_brand` over
@@ -1060,6 +1104,15 @@ async def get_asset_base64(url: str) -> dict[str, str | int]:
     characters (AAAA…, JPEG null padding) are where characters get dropped
     in transcription. Standard decoders (`base64 -d`, Python `b64decode`)
     ignore the newlines; strip them yourself only when building a data URI.
+
+    Document-generation workflows (PPTX, DOCX, PDF): pass the payload
+    programmatically — read `base64` from the tool result and decode it in
+    code. Only fall back to transcribing it (heredoc-style) when no
+    programmatic path exists; hand-retyped payloads are where corruption
+    happens. There is deliberately no `save_path` parameter: this server
+    runs remotely (hosted Lambda, or Docker when self-hosted), so a
+    server-side write can never land on your filesystem — writing the
+    decoded bytes is always the client's job.
 
     ALWAYS verify after writing the decoded file:
 

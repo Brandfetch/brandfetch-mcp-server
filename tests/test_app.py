@@ -9,6 +9,8 @@ def test_app_loads():
     assert app is not None
     # Server instructions steer clients to direct CDN fetch when egress allows
     assert "*.brandfetch.io" in (mcp.instructions or "")
+    # ...and toward proactive feedback (PRD-4952)
+    assert "send_feedback" in (mcp.instructions or "")
 
 
 def test_asset_resource_template_registered():
