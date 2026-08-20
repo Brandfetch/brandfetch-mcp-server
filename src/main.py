@@ -199,11 +199,12 @@ class NonEmptyBodyMiddleware(BaseHTTPMiddleware):
 
 
 SIGNUP_URL = "https://developers.brandfetch.com/register"
+DASHBOARD_URL = "https://developers.brandfetch.com"
 MISSING_CREDENTIALS_MESSAGE = (
     "Missing API credentials. Authenticate via OAuth when adding the Brandfetch "
     "connector.\n\n"
     f"Don't have an API key yet? Sign up for free at {SIGNUP_URL} . "
-    "The free plan includes 100 requests per month."
+    "The free plan includes 100 requests."
 )
 
 
@@ -257,14 +258,41 @@ _NUDGE_EXCLUDED_STATUSES = {401, 403, 429}
 _NUDGE_ELIGIBLE_CODES = {"fetch_failed", "not_found"}
 
 
+def _quota_exhausted_message(body: str) -> str:
+    # The API's 429 body currently carries {"quota": N, "used": M}; treat those
+    # numbers as a bonus, never a requirement — the shape may evolve.
+    usage = ""
+    try:
+        parsed = json.loads(body)
+    except json.JSONDecodeError:
+        parsed = None
+    if isinstance(parsed, dict):
+        quota, used = parsed.get("quota"), parsed.get("used")
+        if isinstance(quota, int) and isinstance(used, int):
+            usage = f" (used {used} of {quota} credits)"
+    return (
+        f"API quota exhausted{usage}: this API key has no API credits left. "
+        f"Check or upgrade your plan at {DASHBOARD_URL} . "
+        "brand_search and build_logo_urls do not consume credits and keep working."
+    )
+
+
 def _error_message(status: int, body: str, context: str) -> str:
-    messages = {
-        401: "Unauthorized: invalid or missing API key.",
-        403: "Forbidden: your API key is invalid or does not have access to this resource. Double-check the apiKey in your MCP server URL.",
-        404: context,
-        429: "API key quota exceeded. Please check your plan limits.",
-    }
-    message = messages.get(status, f"Brandfetch API error ({status}): {body}")
+    if status == 429:
+        message = _quota_exhausted_message(body)
+    else:
+        messages = {
+            401: "Unauthorized: invalid or missing API key.",
+            # The API answers 403 both for keys without access and for plans
+            # with zero API credits — don't blame the key alone.
+            403: (
+                "Forbidden: this API key has no available API credits or does "
+                "not have access to this resource. The key itself may be valid "
+                f"— check your plan and key status at {DASHBOARD_URL} ."
+            ),
+            404: context,
+        }
+        message = messages.get(status, f"Brandfetch API error ({status}): {body}")
     if status not in _NUDGE_EXCLUDED_STATUSES:
         message = f"{message} {FEEDBACK_NUDGE}"
     return message
@@ -686,6 +714,8 @@ async def get_brand(identifier: str) -> ToolResult:
       retry — fall back to displaying the `icon` URL from `brand_search`
       (display-only, not downloadable) or inform the user.
     - 404: Identifier not found. Try `brand_search` with a name query instead.
+    - 429: API quota exhausted. Do not retry — `brand_search` and
+      `build_logo_urls` do not consume quota and keep working.
 
     If the returned data is visibly wrong or stale (wrong logo, outdated
     colors, missing company info), report it with send_feedback (category
@@ -756,6 +786,10 @@ async def enrich_transaction(transaction_label: str, country_code: str) -> str:
     - transaction_label: "AMZN MKTP US", country_code: "US"
     - transaction_label: "IKEA", country_code: "CH"
     - transaction_label: "SQ *BLUE BOTTLE", country_code: "US"
+
+    Errors:
+    - 429: API quota exhausted. Do not retry — `brand_search` and
+      `build_logo_urls` do not consume quota and keep working.
 
     Args:
         transaction_label: The raw text from a credit card or bank statement
@@ -869,8 +903,10 @@ async def get_brand_context(domain: str) -> str:
       tell the user that subjective brand context is currently unavailable.
     - 404: No context available for this domain. Try `brand_search` to find
       a canonical domain, then retry.
-    - 403: Authentication or access tier issue. Do not retry; surface to the
-      user.
+    - 403: Authentication, access tier, or exhausted-credits issue. Do not
+      retry; surface to the user.
+    - 429: API quota exhausted. Do not retry — `brand_search` and
+      `build_logo_urls` do not consume quota and keep working.
 
     Args:
         domain: The brand's exact domain, lowercase, no scheme or path

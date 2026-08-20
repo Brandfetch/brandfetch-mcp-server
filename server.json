@@ -3,7 +3,7 @@
   "name": "io.brandfetch/brandfetch",
   "title": "Brandfetch",
   "description": "Search brands and retrieve design assets, company data, other brand context from Brandfetch's API",
-  "version": "1.2.1",
+  "version": "1.2.2",
   "websiteUrl": "https://docs.brandfetch.com/mcp/overview",
   "repository": {
     "url": "https://github.com/Brandfetch/brandfetch-mcp-server",

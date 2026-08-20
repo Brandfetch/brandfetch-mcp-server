@@ -69,6 +69,18 @@ Add to `~/.cursor/mcp.json` (or the project `.cursor/mcp.json`):
 Clients that support OAuth can instead point at `https://mcp.brandfetch.io/mcp`
 with no token and complete the authorization flow in the browser.
 
+## Quota errors
+
+`get_brand`, `enrich_transaction`, and `get_brand_context` consume API credits
+from your plan; `brand_search` and `build_logo_urls` don't and keep working
+when your credits run out.
+
+- **429 "API quota exhausted"** — your key has used all of its API credits.
+  Check usage or upgrade in the [Brandfetch dashboard](https://developers.brandfetch.com).
+- **403 "Forbidden"** — the key has no available API credits or lacks access
+  to that endpoint. The key itself may be valid, so check your plan and key
+  status in the dashboard before rotating it.
+
 ## Self-hosting
 
 This is an HTTP (streamable-http) MCP server built with
